@@ -67,6 +67,11 @@
     background: rgba(16, 24, 32, 0.78);
   }
   #hint:empty { display: none; }
+  #flash {
+    position: absolute; inset: 0; background: #fff; opacity: 0; pointer-events: none;
+    transition: opacity 0.3s ease-out;
+  }
+  #flash.on { opacity: 0.85; transition: none; }
 
   /* Barres d’action */
   .bar {
@@ -160,13 +165,14 @@
 <section id="screen-scan" class="screen">
   <header class="top">
     <h1>Scanner</h1>
-    <label class="auto"><input type="checkbox" id="chkAuto" checked> Capture automatique</label>
+    <label class="auto"><input type="checkbox" id="chkAuto" checked> Scan automatique</label>
     <span id="status" class="status">Chargement…</span>
   </header>
   <div id="stageWrap">
     <div id="stage">
       <video id="video" playsinline muted autoplay></video>
       <canvas id="overlay"></canvas>
+      <div id="flash"></div>
       <div id="hint"></div>
     </div>
   </div>
@@ -233,8 +239,11 @@
 // placez à côté de index.html), sinon téléchargement unique depuis docs.opencv.org.
 const CV_SOURCES = ['./opencv.js', 'https://docs.opencv.org/4.10.0/opencv.js'];
 const DETECT_MAX_SIDE = 480;   // taille de l’image analysée pour la détection
-const DETECT_EVERY_MS = 180;   // fréquence de détection
-const STABLE_FRAMES = 5;       // nombre de détections stables avant capture auto (~1 s)
+const DETECT_EVERY_MS = 150;   // fréquence de détection
+const HOLD_MS = 1000;          // durée d’immobilité avant le scan automatique
+const GRACE_MS = 500;          // détection perdue brièvement : le compteur n’est pas remis à zéro
+const MOVE_TOL = 0.04;         // tolérance de mouvement des coins (part de la largeur)
+const MIN_AREA = 0.10;         // part minimale de l’image occupée par le document
 const OUTPUT_MAX_SIDE = 2400;  // taille maximale de la page redressée
 const IMPORT_MAX_SIDE = 3000;  // taille maximale d’une image importée
 const JPEG_QUALITY = 0.85;
@@ -256,8 +265,14 @@ const state = {
   warped: null,     // canvas : page redressée, sans filtre
   filter: 'color',
   pages: [],        // { blob, w, h, url }
-  lastQuad: null,
-  stable: 0,
+  lastQuad: null,     // dernier quadrilatère détecté (repère de la vidéo)
+  anchor: null,       // quadrilatère de référence pour mesurer l’immobilité
+  stableSince: 0,     // instant depuis lequel le document est immobile
+  lastSeen: 0,        // dernier instant où un document a été vu
+  noQuadSince: 0,     // instant depuis lequel plus rien n’est détecté
+  needRearm: false,   // un scan vient d’être fait : attendre un autre document
+  doneQuad: null,
+  processing: false,
   lastCapture: 0
 };
 
@@ -345,46 +360,80 @@ async function initCv() {
 /* ------------------------------------------------------------------ */
 /*  Détection du document (OpenCV)                                     */
 /* ------------------------------------------------------------------ */
-// Retourne 4 points ordonnés HG, HD, BD, BG (repère de l’image analysée), ou null.
-function findQuad(src) {
-  const gray = new cv.Mat(), blur = new cv.Mat(), edges = new cv.Mat();
+// Cherche le plus grand quadrilatère dans un masque binaire (contours ou zones claires).
+function quadFromMask(mask, frameArea) {
   const contours = new cv.MatVector(), hier = new cv.Mat();
-  const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
-  let best = null;
+  let best = null, bestArea = 0;
   try {
-    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-    cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0);
-    cv.Canny(blur, edges, 50, 150);
-    cv.dilate(edges, edges, kernel);
-    cv.findContours(edges, contours, hier, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
-
-    const minArea = src.rows * src.cols * 0.15;
-    let bestArea = 0;
+    cv.findContours(mask, contours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
     for (let i = 0; i < contours.size(); i++) {
       const c = contours.get(i);
       const area = cv.contourArea(c);
-      if (area > minArea && area > bestArea) {
-        const ap = new cv.Mat();
-        const peri = cv.arcLength(c, true);
-        cv.approxPolyDP(c, ap, 0.02 * peri, true);
-        const convex = typeof cv.isContourConvex !== 'function' || cv.isContourConvex(ap);
-        if (ap.rows === 4 && convex) {
-          const d = ap.data32S;
-          best = [
-            { x: d[0], y: d[1] }, { x: d[2], y: d[3] },
-            { x: d[4], y: d[5] }, { x: d[6], y: d[7] }
-          ];
-          bestArea = area;
+      // On écarte les petites formes et le cadre entier de l’image.
+      if (area > frameArea * MIN_AREA && area < frameArea * 0.97 && area > bestArea) {
+        const hull = new cv.Mat();
+        cv.convexHull(c, hull, false, true);
+        const peri = cv.arcLength(hull, true);
+        // Tolérance croissante : un papier un peu courbé ou un coin masqué est accepté.
+        for (const eps of [0.02, 0.03, 0.045, 0.06]) {
+          const ap = new cv.Mat();
+          cv.approxPolyDP(hull, ap, eps * peri, true);
+          if (ap.rows === 4) {
+            const d = ap.data32S;
+            best = [
+              { x: d[0], y: d[1] }, { x: d[2], y: d[3] },
+              { x: d[4], y: d[5] }, { x: d[6], y: d[7] }
+            ];
+            bestArea = area;
+            ap.delete();
+            break;
+          }
+          ap.delete();
         }
-        ap.delete();
+        hull.delete();
       }
       c.delete();
     }
   } finally {
-    gray.delete(); blur.delete(); edges.delete();
-    contours.delete(); hier.delete(); kernel.delete();
+    contours.delete(); hier.delete();
   }
-  return best ? orderCorners(best) : null;
+  return best;
+}
+
+function morph(src, dst, op, kernel) {
+  cv.morphologyEx(src, dst, op, kernel, new cv.Point(-1, -1), 1,
+    cv.BORDER_CONSTANT, cv.morphologyDefaultBorderValue());
+}
+
+// Retourne 4 points ordonnés HG, HD, BD, BG (repère de l’image analysée), ou null.
+// Stratégie 1 : contours (Canny) avec fermeture des petites coupures.
+// Stratégie 2 (si la 1 échoue) : contraste entre le papier clair et le fond (Otsu).
+function findQuad(src) {
+  const gray = new cv.Mat(), blur = new cv.Mat(), edges = new cv.Mat(), bin = new cv.Mat();
+  const k3 = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
+  const k7 = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(7, 7));
+  const frameArea = src.rows * src.cols;
+  let quad = null;
+  try {
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0);
+
+    cv.Canny(blur, edges, 40, 120);
+    cv.dilate(edges, edges, k3);
+    morph(edges, edges, cv.MORPH_CLOSE, k7);
+    quad = quadFromMask(edges, frameArea);
+
+    if (!quad) {
+      cv.threshold(blur, bin, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU);
+      morph(bin, bin, cv.MORPH_OPEN, k7);
+      morph(bin, bin, cv.MORPH_CLOSE, k7);
+      quad = quadFromMask(bin, frameArea);
+    }
+  } finally {
+    gray.delete(); blur.delete(); edges.delete(); bin.delete();
+    k3.delete(); k7.delete();
+  }
+  return quad ? orderCorners(quad) : null;
 }
 
 function orderCorners(pts) {
@@ -454,7 +503,7 @@ async function startCamera() {
     layoutStage();
     setHint('Placez le document dans le cadre');
     state.scanning = true;
-    state.stable = 0;
+    resetTracking();
     requestAnimationFrame(loop);
   } catch (e) {
     const msg = e && e.name === 'NotAllowedError'
@@ -469,15 +518,14 @@ function stopCamera() {
   if (state.stream) { state.stream.getTracks().forEach((t) => t.stop()); state.stream = null; }
   video.srcObject = null;
   octx.clearRect(0, 0, overlay.width, overlay.height);
-  state.lastQuad = null;
-  state.stable = 0;
+  resetTracking();
 }
 
 let lastDetect = 0;
 function loop(ts) {
   if (!state.scanning) return;
   requestAnimationFrame(loop);
-  if (!state.cvReady || video.readyState < 2 || !video.videoWidth) return;
+  if (!state.cvReady || state.processing || video.readyState < 2 || !video.videoWidth) return;
   if (ts - lastDetect < DETECT_EVERY_MS) return;
   lastDetect = ts;
   detectFrame();
@@ -489,8 +537,24 @@ function detectFrame() {
     quad = detectOnCanvas(video);
   } catch (e) {
     console.error(e);
+    setHint('Erreur de détection : ' + (e && e.message ? e.message : e));
+    return;
   }
   updateOverlay(quad);
+}
+
+function resetTracking() {
+  state.lastQuad = null;
+  state.anchor = null;
+  state.stableSince = 0;
+  state.lastSeen = 0;
+  state.noQuadSince = 0;
+  state.needRearm = false;
+  state.doneQuad = null;
+}
+
+function sameQuad(a, b, tol) {
+  return a.every((p, i) => Math.hypot(p.x - b[i].x, p.y - b[i].y) < tol);
 }
 
 function updateOverlay(quad) {
@@ -498,52 +562,133 @@ function updateOverlay(quad) {
   if (overlay.width !== vw || overlay.height !== vh) { overlay.width = vw; overlay.height = vh; }
   octx.clearRect(0, 0, vw, vh);
 
-  if (!quad) {
-    state.stable = 0;
-    state.lastQuad = null;
-    setHint('Placez le document dans le cadre');
+  const now = performance.now();
+  const tol = vw * MOVE_TOL;
+  const auto = $('chkAuto').checked;
+
+  if (quad) {
+    state.lastSeen = now;
+    state.noQuadSince = 0;
+    // Un scan vient d’être fait : on attend que le document change ou soit retiré.
+    if (state.needRearm && state.doneQuad && !sameQuad(quad, state.doneQuad, tol * 2)) {
+      state.needRearm = false;
+    }
+    // Le compteur d’immobilité repart seulement si les coins ont vraiment bougé.
+    if (!state.anchor || !sameQuad(quad, state.anchor, tol)) {
+      state.anchor = quad;
+      state.stableSince = now;
+    }
+    state.lastQuad = quad;
+  } else {
+    if (!state.noQuadSince) state.noQuadSince = now;
+    // Une détection manquée ne remet pas le compteur à zéro avant GRACE_MS.
+    if (now - state.lastSeen > GRACE_MS) {
+      state.anchor = null;
+      state.lastQuad = null;
+      state.stableSince = 0;
+      if (now - state.noQuadSince > GRACE_MS) state.needRearm = false;
+    }
+  }
+
+  const q = state.lastQuad;
+  if (!q) {
+    setHint(now - state.noQuadSince > 3000
+      ? 'Aucun contour net. Posez le document sur un fond contrasté, ou utilisez le bouton.'
+      : 'Placez le document dans le cadre');
     return;
   }
-  const tol = vw * 0.025;
-  const steady = state.lastQuad &&
-    quad.every((p, i) => Math.hypot(p.x - state.lastQuad[i].x, p.y - state.lastQuad[i].y) < tol);
-  state.stable = steady ? state.stable + 1 : 0;
-  state.lastQuad = quad;
 
-  const locked = state.stable >= STABLE_FRAMES;
-  const color = locked ? '#7fd1b9' : '#f2a900';
+  const held = state.stableSince ? now - state.stableSince : 0;
+  const progress = state.needRearm ? 1 : Math.min(1, held / HOLD_MS);
+  const color = progress >= 1 ? '#7fd1b9' : '#f2a900';
+
   octx.lineJoin = 'round';
   octx.lineWidth = Math.max(3, vw * 0.006);
   octx.strokeStyle = color;
-  octx.fillStyle = locked ? 'rgba(127, 209, 185, 0.18)' : 'rgba(242, 169, 0, 0.14)';
+  octx.fillStyle = progress >= 1 ? 'rgba(127, 209, 185, 0.18)' : 'rgba(242, 169, 0, 0.14)';
   octx.beginPath();
-  quad.forEach((p, i) => (i ? octx.lineTo(p.x, p.y) : octx.moveTo(p.x, p.y)));
+  q.forEach((p, i) => (i ? octx.lineTo(p.x, p.y) : octx.moveTo(p.x, p.y)));
   octx.closePath();
   octx.fill();
   octx.stroke();
   octx.fillStyle = color;
-  quad.forEach((p) => { octx.beginPath(); octx.arc(p.x, p.y, vw * 0.011, 0, Math.PI * 2); octx.fill(); });
+  q.forEach((p) => { octx.beginPath(); octx.arc(p.x, p.y, vw * 0.011, 0, Math.PI * 2); octx.fill(); });
+  if (auto && !state.needRearm) {
+    octx.fillRect(0, 0, vw * progress, Math.max(4, vh * 0.008));  // barre de progression
+  }
 
-  if (!locked) {
-    setHint('Document détecté, gardez le téléphone immobile');
-  } else if ($('chkAuto').checked) {
-    setHint('Capture…');
-    if (Date.now() - state.lastCapture > 2500) capture();
+  if (state.needRearm) {
+    setHint('Page ajoutée. Passez au document suivant.');
+  } else if (!auto) {
+    setHint('Document détecté, appuyez sur le bouton.');
+  } else if (progress < 1) {
+    setHint('Ne bougez pas… ' + Math.max(0.1, (HOLD_MS - held) / 1000).toFixed(1) + ' s');
   } else {
-    setHint('Prêt, appuyez sur le bouton');
+    setHint('Capture…');
+  }
+
+  if (auto && !state.needRearm && held >= HOLD_MS && Date.now() - state.lastCapture > 1500) {
+    autoScan();
   }
 }
 
-function capture() {
+function grabFrame() {
   const vw = video.videoWidth, vh = video.videoHeight;
-  if (!vw || !vh) return;
+  if (!vw || !vh) return null;
   const c = document.createElement('canvas');
   c.width = vw; c.height = vh;
   c.getContext('2d').drawImage(video, 0, 0, vw, vh);
+  return c;
+}
+
+function flash() {
+  const el = $('flash');
+  el.classList.add('on');
+  requestAnimationFrame(() => requestAnimationFrame(() => el.classList.remove('on')));
+}
+
+// Scan automatique : photo, redressement, filtre et ajout de la page, sans écran intermédiaire.
+async function autoScan() {
+  if (state.processing || !state.lastQuad) return;
+  state.processing = true;
+  try {
+    const quad = state.lastQuad.map((p) => ({ x: p.x, y: p.y }));
+    const raw = grabFrame();
+    if (!raw) return;
+    state.lastCapture = Date.now();
+    state.needRearm = true;
+    state.doneQuad = quad;
+    state.anchor = null;
+    state.stableSince = 0;
+    if (navigator.vibrate) navigator.vibrate(40);
+    flash();
+    await tick();
+    state.raw = raw;
+    state.corners = quad;
+    state.warped = warpToCanvas(raw, quad);
+    applyFilter();
+    await commitPage();
+    toast('Page ' + state.pages.length + ' ajoutée');
+    updateCount();
+  } catch (e) {
+    console.error(e);
+    toast('Le scan automatique a échoué. Utilisez le bouton rond.');
+  } finally {
+    state.processing = false;
+  }
+}
+
+// Capture manuelle : passe par l’écran de recadrage pour ajuster les coins.
+function capture() {
+  if (state.processing) return;
+  const c = grabFrame();
+  if (!c) return;
   state.raw = c;
-  state.corners = state.lastQuad ? state.lastQuad.map((p) => ({ x: p.x, y: p.y })) : defaultCorners(vw, vh);
+  state.corners = state.lastQuad
+    ? state.lastQuad.map((p) => ({ x: p.x, y: p.y }))
+    : defaultCorners(c.width, c.height);
   state.lastCapture = Date.now();
-  state.stable = 0;
+  resetTracking();
   if (navigator.vibrate) navigator.vibrate(30);
   show('crop');
 }
@@ -792,15 +937,23 @@ $('btnRotate').addEventListener('click', async () => {
 
 $('btnResultBack').addEventListener('click', () => show('crop'));
 
-$('btnAddPage').addEventListener('click', async () => {
-  await busy('Enregistrement de la page…', async () => {
-    const blob = await new Promise((r) => resultCanvas.toBlob(r, 'image/jpeg', JPEG_QUALITY));
-    if (!blob) { toast('Impossible d’enregistrer la page.'); return; }
-    state.pages.push({
-      blob, w: resultCanvas.width, h: resultCanvas.height, url: URL.createObjectURL(blob)
-    });
-    updateCount();
+async function commitPage() {
+  const blob = await new Promise((r) => resultCanvas.toBlob(r, 'image/jpeg', JPEG_QUALITY));
+  if (!blob) throw new Error('Encodage JPEG impossible');
+  state.pages.push({
+    blob, w: resultCanvas.width, h: resultCanvas.height, url: URL.createObjectURL(blob)
   });
+  updateCount();
+}
+
+$('btnAddPage').addEventListener('click', async () => {
+  try {
+    await busy('Enregistrement de la page…', commitPage);
+  } catch (e) {
+    console.error(e);
+    toast('Impossible d’enregistrer la page.');
+    return;
+  }
   toast('Page ' + state.pages.length + ' ajoutée');
   show('scan');
 });
