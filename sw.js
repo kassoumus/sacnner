@@ -1,7 +1,7 @@
 // Service worker : met en cache l’application et OpenCV.js pour un usage hors ligne.
 // Après une modification des fichiers, changez le numéro de version ci-dessous
 // pour forcer la mise à jour sur le téléphone.
-const CACHE = 'scanner-v2';
+const CACHE = 'scanner-v3';
 const SHELL = [
   './',
   './index.html',

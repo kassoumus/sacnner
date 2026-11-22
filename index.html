@@ -67,6 +67,10 @@
     background: rgba(16, 24, 32, 0.78);
   }
   #hint:empty { display: none; }
+  #dbg {
+    display: none; position: absolute; left: 8px; top: 8px; padding: 2px 8px; border-radius: 6px;
+    font-size: 0.75rem; background: rgba(16, 24, 32, 0.78); color: var(--paper);
+  }
   #flash {
     position: absolute; inset: 0; background: #fff; opacity: 0; pointer-events: none;
     transition: opacity 0.3s ease-out;
@@ -172,6 +176,7 @@
     <div id="stage">
       <video id="video" playsinline muted autoplay></video>
       <canvas id="overlay"></canvas>
+      <div id="dbg"></div>
       <div id="flash"></div>
       <div id="hint"></div>
     </div>
@@ -244,6 +249,12 @@ const HOLD_MS = 1000;          // durée d’immobilité avant le scan automatiq
 const GRACE_MS = 500;          // détection perdue brièvement : le compteur n’est pas remis à zéro
 const MOVE_TOL = 0.04;         // tolérance de mouvement des coins (part de la largeur)
 const MIN_AREA = 0.10;         // part minimale de l’image occupée par le document
+const MIN_SCORE = 0.18;        // note minimale d’un candidat pour être accepté
+const GOOD_SCORE = 0.6;        // note à partir de laquelle on s’arrête de chercher
+const CHROMA_THR = 12;         // écart de couleur toléré à l’intérieur du document
+const CHROMA_POW = 2;          // poids de l’homogénéité des couleurs dans la note
+const BG_TMIN = 6;             // seuil minimal de différence avec le fond
+const DEBUG = /[?&#]debug/.test(location.href);  // ajoutez ?debug à l’adresse pour voir la méthode utilisée
 const OUTPUT_MAX_SIDE = 2400;  // taille maximale de la page redressée
 const IMPORT_MAX_SIDE = 3000;  // taille maximale d’une image importée
 const JPEG_QUALITY = 0.85;
@@ -273,6 +284,7 @@ const state = {
   needRearm: false,   // un scan vient d’être fait : attendre un autre document
   doneQuad: null,
   processing: false,
+  dbg: null,          // dernier résultat de détection (méthode, note) pour le mode debug
   lastCapture: 0
 };
 
@@ -360,44 +372,118 @@ async function initCv() {
 /* ------------------------------------------------------------------ */
 /*  Détection du document (OpenCV)                                     */
 /* ------------------------------------------------------------------ */
-// Cherche le plus grand quadrilatère dans un masque binaire (contours ou zones claires).
-function quadFromMask(mask, frameArea) {
+// <detection>
+function polyArea(q) {
+  let a = 0;
+  for (let i = 0; i < 4; i++) {
+    const j = (i + 1) % 4;
+    a += q[i].x * q[j].y - q[j].x * q[i].y;
+  }
+  return Math.abs(a) / 2;
+}
+
+// Note de 0 à 1 : grande taille, forme proche d’un rectangle, côtés opposés comparables.
+function scoreQuad(q, w, h, shapeArea) {
+  const qa = polyArea(q);
+  const frac = qa / (w * h);
+  if (frac < MIN_AREA) return 0;
+  const fit = Math.min(shapeArea, qa) / Math.max(shapeArea, qa);
+  let dev = 0;
+  for (let i = 0; i < 4; i++) {
+    const a = q[(i + 3) % 4], b = q[i], c = q[(i + 1) % 4];
+    const v1x = a.x - b.x, v1y = a.y - b.y, v2x = c.x - b.x, v2y = c.y - b.y;
+    const den = (Math.hypot(v1x, v1y) * Math.hypot(v2x, v2y)) || 1;
+    const cos = Math.max(-1, Math.min(1, (v1x * v2x + v1y * v2y) / den));
+    dev += Math.abs(Math.acos(cos) * 180 / Math.PI - 90);
+  }
+  const angle = Math.max(0, 1 - dev / 4 / 40);
+  const side = (i) => Math.hypot(q[i].x - q[(i + 1) % 4].x, q[i].y - q[(i + 1) % 4].y);
+  const l = [side(0), side(1), side(2), side(3)];
+  const ratio = (Math.min(l[0], l[2]) / (Math.max(l[0], l[2]) || 1)) *
+                (Math.min(l[1], l[3]) / (Math.max(l[1], l[3]) || 1));
+  let score = Math.pow(frac, 0.6) * fit * angle * Math.sqrt(ratio);
+  // Un quadrilatère collé aux bords de l’image est probablement le cadre lui-même.
+  const m = 0.02 * Math.min(w, h);
+  const touching = q.filter((p) => p.x < m || p.y < m || p.x > w - m || p.y > h - m).length;
+  if (touching >= 3) score *= 0.25;
+  return score;
+}
+
+// Part des points du quadrilatère dont la couleur (chrominance a et b) reste proche
+// de la moyenne. Un vrai document est uniforme ; un quadrilatère qui déborde sur des
+// objets ou un fond coloré l’est beaucoup moins. Insensible aux ombres (on ignore la luminosité).
+function chromaHomogeneity(lab, q) {
+  const cols = lab.cols, rows = lab.rows, d = lab.data;
+  const NU = 24, NV = 32;
+  const as = new Float32Array(NU * NV), bs = new Float32Array(NU * NV);
+  let n = 0, sa = 0, sb = 0;
+  for (let i = 0; i < NU; i++) {
+    const u = (i + 0.5) / NU;
+    const tx = q[0].x + (q[1].x - q[0].x) * u, ty = q[0].y + (q[1].y - q[0].y) * u;
+    const bx = q[3].x + (q[2].x - q[3].x) * u, by = q[3].y + (q[2].y - q[3].y) * u;
+    for (let j = 0; j < NV; j++) {
+      const v = (j + 0.5) / NV;
+      const x = Math.min(cols - 1, Math.max(0, Math.round(tx + (bx - tx) * v)));
+      const y = Math.min(rows - 1, Math.max(0, Math.round(ty + (by - ty) * v)));
+      const k = (y * cols + x) * 3;
+      as[n] = d[k + 1]; bs[n] = d[k + 2];
+      sa += as[n]; sb += bs[n];
+      n++;
+    }
+  }
+  const ma = sa / n, mb = sb / n;
+  let ok = 0;
+  for (let i = 0; i < n; i++) {
+    if (Math.hypot(as[i] - ma, bs[i] - mb) < CHROMA_THR) ok++;
+  }
+  return ok / n;
+}
+
+// Candidats (quadrilatères) trouvés dans un masque binaire.
+function candidatesFromMask(mask, w, h, name) {
+  const out = [];
+  const frameArea = w * h;
   const contours = new cv.MatVector(), hier = new cv.Mat();
-  let best = null, bestArea = 0;
   try {
     cv.findContours(mask, contours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    const list = [];
     for (let i = 0; i < contours.size(); i++) {
       const c = contours.get(i);
       const area = cv.contourArea(c);
-      // On écarte les petites formes et le cadre entier de l’image.
-      if (area > frameArea * MIN_AREA && area < frameArea * 0.97 && area > bestArea) {
-        const hull = new cv.Mat();
-        cv.convexHull(c, hull, false, true);
-        const peri = cv.arcLength(hull, true);
-        // Tolérance croissante : un papier un peu courbé ou un coin masqué est accepté.
-        for (const eps of [0.02, 0.03, 0.045, 0.06]) {
-          const ap = new cv.Mat();
-          cv.approxPolyDP(hull, ap, eps * peri, true);
-          if (ap.rows === 4) {
-            const d = ap.data32S;
-            best = [
-              { x: d[0], y: d[1] }, { x: d[2], y: d[3] },
-              { x: d[4], y: d[5] }, { x: d[6], y: d[7] }
-            ];
-            bestArea = area;
-            ap.delete();
-            break;
-          }
+      c.delete();
+      if (area > frameArea * MIN_AREA && area < frameArea * 0.98) list.push({ i, area });
+    }
+    list.sort((a, b) => b.area - a.area);
+    for (const item of list.slice(0, 4)) {
+      const c = contours.get(item.i);
+      const hull = new cv.Mat();
+      cv.convexHull(c, hull, false, true);
+      const hullArea = cv.contourArea(hull);
+      const peri = cv.arcLength(hull, true);
+      // Tolérance croissante : un papier un peu courbé ou un coin masqué est accepté.
+      for (const eps of [0.02, 0.03, 0.045, 0.06]) {
+        const ap = new cv.Mat();
+        cv.approxPolyDP(hull, ap, eps * peri, true);
+        if (ap.rows === 4) {
+          const dd = ap.data32S;
+          const q = orderCorners([
+            { x: dd[0], y: dd[1] }, { x: dd[2], y: dd[3] },
+            { x: dd[4], y: dd[5] }, { x: dd[6], y: dd[7] }
+          ]);
+          const score = scoreQuad(q, w, h, hullArea);
+          if (score > 0) out.push({ quad: q, score, name });
           ap.delete();
+          break;
         }
-        hull.delete();
+        ap.delete();
       }
+      hull.delete();
       c.delete();
     }
   } finally {
     contours.delete(); hier.delete();
   }
-  return best;
+  return out;
 }
 
 function morph(src, dst, op, kernel) {
@@ -405,36 +491,136 @@ function morph(src, dst, op, kernel) {
     cv.BORDER_CONSTANT, cv.morphologyDefaultBorderValue());
 }
 
-// Retourne 4 points ordonnés HG, HD, BD, BG (repère de l’image analysée), ou null.
-// Stratégie 1 : contours (Canny) avec fermeture des petites coupures.
-// Stratégie 2 (si la 1 échoue) : contraste entre le papier clair et le fond (Otsu).
-function findQuad(src) {
-  const gray = new cv.Mat(), blur = new cv.Mat(), edges = new cv.Mat(), bin = new cv.Mat();
-  const k3 = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
-  const k7 = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(7, 7));
-  const frameArea = src.rows * src.cols;
-  let quad = null;
+// Parcourt les pixels de la bordure de l’image (là où il y a le plus de chances de voir le fond).
+function forBorder(w, h, fn) {
+  const b = Math.max(3, Math.round(Math.min(w, h) * 0.05));
+  for (let y = 0; y < h; y++) {
+    if (y < b || y >= h - b) { for (let x = 0; x < w; x++) fn(x, y); }
+    else {
+      for (let x = 0; x < b; x++) fn(x, y);
+      for (let x = w - b; x < w; x++) fn(x, y);
+    }
+  }
+}
+
+function histMedian(hist, total) {
+  let acc = 0;
+  for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc * 2 >= total) return v; }
+  return 255;
+}
+
+// Masque « tout ce qui ne ressemble pas au fond ». La couleur du fond est la médiane de la
+// bordure (robuste même si le document touche le bord) et le seuil s’adapte au bruit du fond.
+function backgroundMask(lab, mask, k5, k7) {
+  const w = lab.cols, h = lab.rows, d = lab.data;
+  const hist = [new Uint32Array(256), new Uint32Array(256), new Uint32Array(256)];
+  let n = 0;
+  forBorder(w, h, (x, y) => {
+    const i = (y * w + x) * 3;
+    hist[0][d[i]]++; hist[1][d[i + 1]]++; hist[2][d[i + 2]]++;
+    n++;
+  });
+  const bg = [histMedian(hist[0], n), histMedian(hist[1], n), histMedian(hist[2], n)];
+  const bgMat = new cv.Mat(h, w, lab.type(), new cv.Scalar(bg[0], bg[1], bg[2], 0));
+  const diff = new cv.Mat(), vec = new cv.MatVector();
+  const s1 = new cv.Mat(), s2 = new cv.Mat();
   try {
-    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    cv.absdiff(lab, bgMat, diff);
+    cv.split(diff, vec);
+    const c0 = vec.get(0), c1 = vec.get(1), c2 = vec.get(2);
+    cv.add(c0, c1, s1);
+    cv.add(s1, c2, s2);
+    c0.delete(); c1.delete(); c2.delete();
+    const sd = s2.data;
+    const h1 = new Uint32Array(256);
+    forBorder(w, h, (x, y) => { h1[sd[y * w + x]]++; });
+    const med = histMedian(h1, n);
+    const h2 = new Uint32Array(256);
+    for (let v = 0; v < 256; v++) h2[Math.abs(v - med)] += h1[v];
+    const mad = histMedian(h2, n) * 1.4826;
+    const T = Math.max(BG_TMIN, med + 3 * mad);
+    cv.threshold(s2, mask, T, 255, cv.THRESH_BINARY);
+    morph(mask, mask, cv.MORPH_OPEN, k5);
+    morph(mask, mask, cv.MORPH_CLOSE, k7);
+  } finally {
+    bgMat.delete(); diff.delete(); vec.delete(); s1.delete(); s2.delete();
+  }
+}
+
+// Retourne { quad, score, name } (4 points ordonnés HG, HD, BD, BG dans le repère de l’image
+// analysée) ou null. Plusieurs méthodes se complètent ; on garde le candidat le mieux noté :
+// grand, proche d’un rectangle, et dont le contenu a une couleur homogène.
+function findQuad(src) {
+  const w = src.cols, h = src.rows;
+  const rgb = new cv.Mat(), rgbBlur = new cv.Mat(), lab = new cv.Mat();
+  const gray = new cv.Mat(), blur = new cv.Mat(), mask = new cv.Mat();
+  const k3 = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
+  const k5 = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(5, 5));
+  const k7 = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(7, 7));
+  let best = null;
+
+  const take = (name) => {
+    for (const c of candidatesFromMask(mask, w, h, name)) {
+      if (c.score < MIN_SCORE) continue;
+      const hom = chromaHomogeneity(lab, c.quad);
+      const final = c.score * Math.pow(hom, CHROMA_POW);
+      if (!best || final > best.score) best = { quad: c.quad, score: final, name };
+    }
+    return !!best && best.score >= GOOD_SCORE;
+  };
+
+  const canny = (lo, hi) => () => {
+    cv.Canny(blur, mask, lo, hi);
+    cv.dilate(mask, mask, k3);
+    morph(mask, mask, cv.MORPH_CLOSE, k7);
+  };
+  const paleOtsu = () => {
+    cv.threshold(blur, mask, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU);
+    morph(mask, mask, cv.MORPH_OPEN, k5);
+    morph(mask, mask, cv.MORPH_CLOSE, k7);
+  };
+  const whitePaper = () => {
+    const hsv = new cv.Mat();
+    let low = null, high = null;
+    try {
+      cv.cvtColor(rgb, hsv, cv.COLOR_RGB2HSV, 0);
+      const vLow = Math.max(70, Math.min(190, cv.mean(hsv)[2] * 0.95));
+      low = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), new cv.Scalar(0, 0, vLow, 0));
+      high = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), new cv.Scalar(180, 70, 255, 255));
+      cv.inRange(hsv, low, high, mask);
+      morph(mask, mask, cv.MORPH_OPEN, k5);
+      morph(mask, mask, cv.MORPH_CLOSE, k7);
+    } finally {
+      hsv.delete(); if (low) low.delete(); if (high) high.delete();
+    }
+  };
+
+  try {
+    cv.cvtColor(src, rgb, cv.COLOR_RGBA2RGB, 0);
+    cv.GaussianBlur(rgb, rgbBlur, new cv.Size(5, 5), 0);
+    cv.cvtColor(rgbBlur, lab, cv.COLOR_RGB2Lab, 0);
+    cv.cvtColor(rgb, gray, cv.COLOR_RGB2GRAY, 0);
     cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0);
 
-    cv.Canny(blur, edges, 40, 120);
-    cv.dilate(edges, edges, k3);
-    morph(edges, edges, cv.MORPH_CLOSE, k7);
-    quad = quadFromMask(edges, frameArea);
-
-    if (!quad) {
-      cv.threshold(blur, bin, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU);
-      morph(bin, bin, cv.MORPH_OPEN, k7);
-      morph(bin, bin, cv.MORPH_CLOSE, k7);
-      quad = quadFromMask(bin, frameArea);
+    const steps = [
+      ['contours', canny(60, 160)],
+      ['contours sensibles', canny(25, 75)],
+      ['papier clair', paleOtsu],
+      ['papier blanc', whitePaper],
+      ['fond', () => backgroundMask(lab, mask, k5, k7)]
+    ];
+    for (const [name, prepare] of steps) {
+      let done = false;
+      try { prepare(); done = take(name); } catch (e) { console.warn(name, e); }
+      if (done) break;
     }
   } finally {
-    gray.delete(); blur.delete(); edges.delete(); bin.delete();
-    k3.delete(); k7.delete();
+    rgb.delete(); rgbBlur.delete(); lab.delete(); gray.delete(); blur.delete(); mask.delete();
+    k3.delete(); k5.delete(); k7.delete();
   }
-  return quad ? orderCorners(quad) : null;
+  return best ? { quad: best.quad, score: best.score, name: best.name } : null;
 }
+// </detection>
 
 function orderCorners(pts) {
   const sum = (p) => p.x + p.y, diff = (p) => p.x - p.y;
@@ -461,10 +647,11 @@ function detectOnCanvas(canvas) {
   const dh = Math.max(1, Math.round(canvas.height * sc));
   detCanvas.width = dw; detCanvas.height = dh;
   detCtx.drawImage(canvas, 0, 0, dw, dh);
-  let quad = null;
+  let res = null;
   const src = cv.imread(detCanvas);
-  try { quad = findQuad(src); } finally { src.delete(); }
-  return quad ? quad.map((p) => ({ x: p.x / sc, y: p.y / sc })) : null;
+  try { res = findQuad(src); } finally { src.delete(); }
+  state.dbg = res ? { name: res.name, score: res.score } : null;
+  return res ? res.quad.map((p) => ({ x: p.x / sc, y: p.y / sc })) : null;
 }
 
 /* ------------------------------------------------------------------ */
@@ -534,7 +721,13 @@ function loop(ts) {
 function detectFrame() {
   let quad = null;
   try {
+    const t0 = performance.now();
     quad = detectOnCanvas(video);
+    if (DEBUG) {
+      $('dbg').textContent = (state.dbg
+        ? state.dbg.name + ', note ' + state.dbg.score.toFixed(2)
+        : 'rien détecté') + ', ' + Math.round(performance.now() - t0) + ' ms';
+    }
   } catch (e) {
     console.error(e);
     setHint('Erreur de détection : ' + (e && e.message ? e.message : e));
@@ -565,6 +758,12 @@ function updateOverlay(quad) {
   const now = performance.now();
   const tol = vw * MOVE_TOL;
   const auto = $('chkAuto').checked;
+
+  // Lissage : réduit le tremblement des coins d’une image à l’autre.
+  if (quad && state.lastQuad && sameQuad(quad, state.lastQuad, tol * 3)) {
+    const prev = state.lastQuad;
+    quad = quad.map((p, i) => ({ x: 0.55 * p.x + 0.45 * prev[i].x, y: 0.55 * p.y + 0.45 * prev[i].y }));
+  }
 
   if (quad) {
     state.lastSeen = now;
@@ -684,9 +883,11 @@ function capture() {
   const c = grabFrame();
   if (!c) return;
   state.raw = c;
-  state.corners = state.lastQuad
-    ? state.lastQuad.map((p) => ({ x: p.x, y: p.y }))
-    : defaultCorners(c.width, c.height);
+  let corners = state.lastQuad ? state.lastQuad.map((p) => ({ x: p.x, y: p.y })) : null;
+  if (!corners) {
+    try { corners = detectOnCanvas(c); } catch (e) { console.error(e); }
+  }
+  state.corners = corners || defaultCorners(c.width, c.height);
   state.lastCapture = Date.now();
   resetTracking();
   if (navigator.vibrate) navigator.vibrate(30);
@@ -1124,6 +1325,7 @@ if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('sw.js').catch((e) => console.warn('Service worker :', e));
 }
 
+if (DEBUG) $('dbg').style.display = 'block';
 updateCount();
 show('scan');
 initCv();
