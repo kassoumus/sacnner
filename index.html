@@ -817,19 +817,10 @@ function sameQuad(a, b, tol) {
   return a.every((p, i) => Math.hypot(p.x - b[i].x, p.y - b[i].y) < tol);
 }
 
-function medianQuad(list) {
-  const med = (a) => {
-    const t = a.slice().sort((x, y) => x - y), m = t.length >> 1;
-    return t.length % 2 ? t[m] : (t[m - 1] + t[m]) / 2;
-  };
-  return [0, 1, 2, 3].map((i) => ({ x: med(list.map((q) => q[i].x)), y: med(list.map((q) => q[i].y)) }));
-}
-
-// Cadre « de consensus » : médiane des détections récentes qui concordent avec le cadre affiché.
-// Renvoie null si la détection est trop instable pour qu’un scan automatique soit fiable.
-function consensusQuad(now, ref, tol) {
-  const near = state.hist.filter((h) => now - h.t <= AGREE_MS && sameQuad(h.q, ref, tol));
-  return near.length >= AGREE_MIN ? medianQuad(near.map((h) => h.q)) : null;
+// Contrôle de fiabilité : au moins AGREE_MIN détections récentes concordent avec le cadre affiché.
+// Si ce n’est pas le cas, la détection est trop instable pour un scan automatique.
+function quadsAgree(now, ref, tol) {
+  return state.hist.filter((h) => now - h.t <= AGREE_MS && sameQuad(h.q, ref, tol)).length >= AGREE_MIN;
 }
 
 function updateOverlay(quad) {
@@ -921,8 +912,7 @@ function updateOverlay(quad) {
   }
 
   if (auto && !state.needRearm && held >= HOLD_MS && Date.now() - state.lastCapture > 1500) {
-    const cq = consensusQuad(now, q, tol * 1.5);
-    if (cq) autoScan(cq);
+    if (quadsAgree(now, q, tol * 1.5)) autoScan(q.map((p) => ({ x: p.x, y: p.y })));
     else setHint('Détection instable, recadrez le document.');
   }
 }
@@ -980,7 +970,8 @@ function capture() {
   const c = grabFrame();
   if (!c) return;
   state.raw = c;
-  let corners = state.lastQuad ? state.lastQuad.map((p) => ({ x: p.x, y: p.y })) : null;
+  const fresh = state.lastQuad && performance.now() - state.lastSeen <= DISPLAY_MS;
+  let corners = fresh ? state.lastQuad.map((p) => ({ x: p.x, y: p.y })) : null;
   if (!corners) {
     try { corners = detectOnCanvas(c); } catch (e) { console.error(e); }
   }
