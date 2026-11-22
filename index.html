@@ -246,9 +246,13 @@ const CV_SOURCES = ['./opencv.js', 'https://docs.opencv.org/4.10.0/opencv.js'];
 const DETECT_MAX_SIDE = 480;   // taille de l’image analysée pour la détection
 const DETECT_EVERY_MS = 150;   // fréquence de détection
 const HOLD_MS = 1000;          // durée d’immobilité avant le scan automatique
-const GRACE_MS = 1200;         // détection perdue brièvement : le compteur n’est pas remis à zéro
+const GRACE_MS = 1200;         // détection perdue brièvement : les compteurs ne sont pas remis à zéro
+const DISPLAY_MS = 500;        // le cadre n’est affiché que s’il a été vu il y a moins de 0,5 s
 const REARM_MS = 1200;         // document absent plus longtemps : prêt pour le document suivant
-const MOVE_TOL = 0.06;         // tolérance de mouvement des coins (part de la largeur)
+const MOVE_TOL = 0.04;         // tolérance de mouvement des coins (part de la largeur)
+const SMOOTH_TOL = 0.02;       // lissage des coins seulement pour un simple tremblement (part de la largeur)
+const AGREE_MS = 2500;         // fenêtre pour vérifier que les détections récentes concordent
+const AGREE_MIN = 3;           // nombre minimal de détections concordantes avant un scan automatique
 const MOTION_THR = 8;          // écart d’image au-delà duquel la caméra est jugée en mouvement
 const MIN_AREA = 0.10;         // part minimale de l’image occupée par le document
 const MIN_SCORE = 0.18;        // note minimale d’un candidat pour être accepté
@@ -288,6 +292,7 @@ const state = {
   processing: false,
   dbg: null,          // dernier résultat de détection (méthode, note) pour le mode debug
   quadSince: 0,       // instant depuis lequel un document est présent dans le cadre
+  hist: [],           // détections récentes { t, q } pour vérifier qu’elles concordent
   motionRef: null,    // petite image de référence pour mesurer le mouvement de la caméra
   motionSince: 0,     // instant depuis lequel la caméra est immobile
   motionBad: 0,       // nombre de mesures de mouvement consécutives au-dessus du seuil
@@ -802,6 +807,7 @@ function resetTracking() {
   state.needRearm = false;
   state.doneQuad = null;
   state.quadSince = 0;
+  state.hist = [];
   state.motionRef = null;
   state.motionSince = 0;
   state.motionBad = 0;
@@ -809,6 +815,21 @@ function resetTracking() {
 
 function sameQuad(a, b, tol) {
   return a.every((p, i) => Math.hypot(p.x - b[i].x, p.y - b[i].y) < tol);
+}
+
+function medianQuad(list) {
+  const med = (a) => {
+    const t = a.slice().sort((x, y) => x - y), m = t.length >> 1;
+    return t.length % 2 ? t[m] : (t[m - 1] + t[m]) / 2;
+  };
+  return [0, 1, 2, 3].map((i) => ({ x: med(list.map((q) => q[i].x)), y: med(list.map((q) => q[i].y)) }));
+}
+
+// Cadre « de consensus » : médiane des détections récentes qui concordent avec le cadre affiché.
+// Renvoie null si la détection est trop instable pour qu’un scan automatique soit fiable.
+function consensusQuad(now, ref, tol) {
+  const near = state.hist.filter((h) => now - h.t <= AGREE_MS && sameQuad(h.q, ref, tol));
+  return near.length >= AGREE_MIN ? medianQuad(near.map((h) => h.q)) : null;
 }
 
 function updateOverlay(quad) {
@@ -820,8 +841,9 @@ function updateOverlay(quad) {
   const tol = vw * MOVE_TOL;
   const auto = $('chkAuto').checked;
 
-  // Lissage : réduit le tremblement des coins d’une image à l’autre.
-  if (quad && state.lastQuad && sameQuad(quad, state.lastQuad, tol * 3)) {
+  // Lissage : réduit le tremblement des coins d’une image à l’autre. Si le cadre change
+  // vraiment (autre candidat, document déplacé), on le prend tel quel : aucun mélange.
+  if (quad && state.lastQuad && sameQuad(quad, state.lastQuad, vw * SMOOTH_TOL)) {
     const prev = state.lastQuad;
     quad = quad.map((p, i) => ({ x: 0.55 * p.x + 0.45 * prev[i].x, y: 0.55 * p.y + 0.45 * prev[i].y }));
   }
@@ -829,6 +851,8 @@ function updateOverlay(quad) {
   if (quad) {
     if (!state.quadSince) state.quadSince = now;
     state.lastSeen = now;
+    state.hist.push({ t: now, q: quad });
+    state.hist = state.hist.filter((h) => now - h.t <= AGREE_MS);
     state.noQuadSince = 0;
     // Un scan vient d’être fait : on attend que le document change ou soit retiré.
     if (state.needRearm && state.doneQuad && !sameQuad(quad, state.doneQuad, tol * 2)) {
@@ -852,7 +876,7 @@ function updateOverlay(quad) {
     }
   }
 
-  const q = state.lastQuad;
+  const q = state.lastQuad && now - state.lastSeen <= DISPLAY_MS ? state.lastQuad : null;
   if (!q) {
     setHint(now - state.noQuadSince > 3000
       ? 'Aucun contour net. Posez le document sur un fond contrasté, ou utilisez le bouton.'
@@ -897,7 +921,9 @@ function updateOverlay(quad) {
   }
 
   if (auto && !state.needRearm && held >= HOLD_MS && Date.now() - state.lastCapture > 1500) {
-    autoScan();
+    const cq = consensusQuad(now, q, tol * 1.5);
+    if (cq) autoScan(cq);
+    else setHint('Détection instable, recadrez le document.');
   }
 }
 
@@ -917,16 +943,12 @@ function flash() {
 }
 
 // Scan automatique : photo, redressement, filtre et ajout de la page, sans écran intermédiaire.
-async function autoScan() {
-  if (state.processing || !state.lastQuad) return;
+async function autoScan(quad) {
+  if (state.processing || !quad) return;
   state.processing = true;
   try {
     const raw = grabFrame();
     if (!raw) return;
-    // Même détection que pour la capture manuelle, sur la photo qui sera réellement redressée.
-    let quad = null;
-    try { quad = detectOnCanvas(raw); } catch (e) { console.error(e); }
-    if (!quad) quad = state.lastQuad.map((p) => ({ x: p.x, y: p.y }));
     state.lastCapture = Date.now();
     state.needRearm = true;
     state.doneQuad = quad;
