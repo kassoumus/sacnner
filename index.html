@@ -246,8 +246,10 @@ const CV_SOURCES = ['./opencv.js', 'https://docs.opencv.org/4.10.0/opencv.js'];
 const DETECT_MAX_SIDE = 480;   // taille de l’image analysée pour la détection
 const DETECT_EVERY_MS = 150;   // fréquence de détection
 const HOLD_MS = 1000;          // durée d’immobilité avant le scan automatique
-const GRACE_MS = 500;          // détection perdue brièvement : le compteur n’est pas remis à zéro
-const MOVE_TOL = 0.04;         // tolérance de mouvement des coins (part de la largeur)
+const GRACE_MS = 1200;         // détection perdue brièvement : le compteur n’est pas remis à zéro
+const REARM_MS = 1200;         // document absent plus longtemps : prêt pour le document suivant
+const MOVE_TOL = 0.06;         // tolérance de mouvement des coins (part de la largeur)
+const MOTION_THR = 8;          // écart d’image au-delà duquel la caméra est jugée en mouvement
 const MIN_AREA = 0.10;         // part minimale de l’image occupée par le document
 const MIN_SCORE = 0.18;        // note minimale d’un candidat pour être accepté
 const GOOD_SCORE = 0.6;        // note à partir de laquelle on s’arrête de chercher
@@ -285,6 +287,11 @@ const state = {
   doneQuad: null,
   processing: false,
   dbg: null,          // dernier résultat de détection (méthode, note) pour le mode debug
+  quadSince: 0,       // instant depuis lequel un document est présent dans le cadre
+  motionRef: null,    // petite image de référence pour mesurer le mouvement de la caméra
+  motionSince: 0,     // instant depuis lequel la caméra est immobile
+  motionBad: 0,       // nombre de mesures de mouvement consécutives au-dessus du seuil
+  motionVal: 0,       // dernière mesure de mouvement (pour le message et le mode debug)
   lastCapture: 0
 };
 
@@ -708,6 +715,53 @@ function stopCamera() {
   resetTracking();
 }
 
+/* Mouvement de la caméra : on compare de petites images (64 x 48), sans leur luminosité
+   moyenne pour ignorer les changements d’exposition. Indépendant de la détection des bords. */
+const motCanvas = document.createElement('canvas');
+motCanvas.width = 64; motCanvas.height = 48;
+const motCtx = motCanvas.getContext('2d', { willReadFrequently: true });
+if ('imageSmoothingQuality' in motCtx) motCtx.imageSmoothingQuality = 'high';
+
+function sampleFrame() {
+  motCtx.drawImage(video, 0, 0, 64, 48);
+  const d = motCtx.getImageData(0, 0, 64, 48).data;
+  const g = new Float32Array(64 * 48);
+  let sum = 0;
+  for (let i = 0, j = 0; i < d.length; i += 4, j++) {
+    g[j] = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+    sum += g[j];
+  }
+  const mean = sum / g.length;
+  for (let j = 0; j < g.length; j++) g[j] -= mean;
+  return g;
+}
+
+function frameDiff(a, b) {
+  let sum = 0;
+  for (let i = 0; i < a.length; i++) sum += Math.abs(a[i] - b[i]);
+  return sum / a.length;
+}
+
+// La référence reste fixe tant que la caméra est immobile : une dérive lente est détectée aussi.
+function updateMotion(now, cur) {
+  if (!state.motionRef) {
+    state.motionRef = cur; state.motionSince = now; state.motionBad = 0;
+    return;
+  }
+  const m = frameDiff(cur, state.motionRef);
+  state.motionVal = m;
+  if (m > MOTION_THR * 2) {
+    state.motionBad = 2;
+  } else if (m > MOTION_THR) {
+    state.motionBad++;
+  } else {
+    state.motionBad = 0;
+  }
+  if (state.motionBad >= 2) {   // une seule mesure isolée est tolérée (tremblement de la main)
+    state.motionRef = cur; state.motionSince = now; state.motionBad = 0;
+  }
+}
+
 let lastDetect = 0;
 function loop(ts) {
   if (!state.scanning) return;
@@ -715,6 +769,7 @@ function loop(ts) {
   if (!state.cvReady || state.processing || video.readyState < 2 || !video.videoWidth) return;
   if (ts - lastDetect < DETECT_EVERY_MS) return;
   lastDetect = ts;
+  try { updateMotion(performance.now(), sampleFrame()); } catch (e) { console.warn(e); }
   detectFrame();
 }
 
@@ -726,7 +781,9 @@ function detectFrame() {
     if (DEBUG) {
       $('dbg').textContent = (state.dbg
         ? state.dbg.name + ', note ' + state.dbg.score.toFixed(2)
-        : 'rien détecté') + ', ' + Math.round(performance.now() - t0) + ' ms';
+        : 'rien détecté') + ', ' + Math.round(performance.now() - t0) + ' ms, mouvement ' +
+        state.motionVal.toFixed(1) + ', immobile ' +
+        (state.motionSince ? ((performance.now() - state.motionSince) / 1000).toFixed(1) : '0.0') + ' s';
     }
   } catch (e) {
     console.error(e);
@@ -744,6 +801,10 @@ function resetTracking() {
   state.noQuadSince = 0;
   state.needRearm = false;
   state.doneQuad = null;
+  state.quadSince = 0;
+  state.motionRef = null;
+  state.motionSince = 0;
+  state.motionBad = 0;
 }
 
 function sameQuad(a, b, tol) {
@@ -766,6 +827,7 @@ function updateOverlay(quad) {
   }
 
   if (quad) {
+    if (!state.quadSince) state.quadSince = now;
     state.lastSeen = now;
     state.noQuadSince = 0;
     // Un scan vient d’être fait : on attend que le document change ou soit retiré.
@@ -781,11 +843,12 @@ function updateOverlay(quad) {
   } else {
     if (!state.noQuadSince) state.noQuadSince = now;
     // Une détection manquée ne remet pas le compteur à zéro avant GRACE_MS.
+    if (now - state.noQuadSince > REARM_MS) state.needRearm = false;
     if (now - state.lastSeen > GRACE_MS) {
       state.anchor = null;
       state.lastQuad = null;
       state.stableSince = 0;
-      if (now - state.noQuadSince > GRACE_MS) state.needRearm = false;
+      state.quadSince = 0;
     }
   }
 
@@ -797,7 +860,12 @@ function updateOverlay(quad) {
     return;
   }
 
-  const held = state.stableSince ? now - state.stableSince : 0;
+  // Deux façons d’être « immobile » : les coins du document ne bougent pas, OU la caméra
+  // entière ne bouge pas (et un document est présent depuis aussi longtemps).
+  const quadHeld = state.stableSince ? now - state.stableSince : 0;
+  const camHeld = state.motionSince && state.quadSince
+    ? Math.min(now - state.motionSince, now - state.quadSince) : 0;
+  const held = Math.max(quadHeld, camHeld);
   const progress = state.needRearm ? 1 : Math.min(1, held / HOLD_MS);
   const color = progress >= 1 ? '#7fd1b9' : '#f2a900';
 
@@ -821,7 +889,9 @@ function updateOverlay(quad) {
   } else if (!auto) {
     setHint('Document détecté, appuyez sur le bouton.');
   } else if (progress < 1) {
-    setHint('Ne bougez pas… ' + Math.max(0.1, (HOLD_MS - held) / 1000).toFixed(1) + ' s');
+    setHint(state.motionVal > MOTION_THR
+      ? 'Stabilisez le téléphone…'
+      : 'Ne bougez pas… ' + Math.max(0.1, (HOLD_MS - held) / 1000).toFixed(1) + ' s');
   } else {
     setHint('Capture…');
   }
@@ -851,14 +921,19 @@ async function autoScan() {
   if (state.processing || !state.lastQuad) return;
   state.processing = true;
   try {
-    const quad = state.lastQuad.map((p) => ({ x: p.x, y: p.y }));
     const raw = grabFrame();
     if (!raw) return;
+    // Même détection que pour la capture manuelle, sur la photo qui sera réellement redressée.
+    let quad = null;
+    try { quad = detectOnCanvas(raw); } catch (e) { console.error(e); }
+    if (!quad) quad = state.lastQuad.map((p) => ({ x: p.x, y: p.y }));
     state.lastCapture = Date.now();
     state.needRearm = true;
     state.doneQuad = quad;
     state.anchor = null;
     state.stableSince = 0;
+    state.motionRef = null;
+    state.motionSince = 0;
     if (navigator.vibrate) navigator.vibrate(40);
     flash();
     await tick();
