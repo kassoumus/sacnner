@@ -40,6 +40,7 @@
   body[data-screen="crop"] #screen-crop,
   body[data-screen="result"] #screen-result,
   body[data-screen="pages"] #screen-pages { display: flex; }
+  body[data-screen="ocr"] #screen-ocr { display: flex; }
 
   .top {
     display: flex; align-items: center; justify-content: space-between; gap: 12px;
@@ -139,7 +140,23 @@
     position: absolute; right: 6px; top: 6px; width: 40px; height: 40px; border-radius: 50%;
     background: rgba(16, 24, 32, 0.85); color: var(--danger); font-size: 1.3rem; line-height: 1;
   }
+  .page-card .ocr {
+    position: absolute; left: 8px; bottom: 8px; min-height: 36px; padding: 0 14px; border-radius: 999px;
+    background: rgba(16, 24, 32, 0.88); color: var(--paper); font-size: 0.85rem; font-weight: 600;
+  }
   .empty { grid-column: 1 / -1; padding: 40px 12px; text-align: center; color: var(--muted); }
+
+  /* Texte extrait (OCR) */
+  .bar.tight { padding-bottom: 0; }
+  select#ocrLang {
+    min-height: 40px; padding: 0 10px; border: 0; border-radius: 10px;
+    background: var(--slate-2); color: var(--paper); font: inherit; font-size: 0.9rem;
+  }
+  #ocrText {
+    flex: 1; min-height: 0; margin: 0 16px 8px; padding: 12px; resize: none;
+    border: 1px solid var(--line); border-radius: 10px; background: var(--slate); color: var(--paper);
+    font: inherit; line-height: 1.5;
+  }
 
   /* Traitement en cours */
   #busy {
@@ -194,6 +211,7 @@
   <header class="top"><h1>Ajuster les coins</h1></header>
   <div id="cropWrap"><canvas id="cropCanvas"></canvas></div>
   <p class="note">Faites glisser les quatre points sur les coins du document.</p>
+  <div class="chips"><button class="chip" id="btnOcrRaw">Lire le texte sans redresser</button></div>
   <footer class="bar spread">
     <button class="btn grow" id="btnCropBack">Reprendre</button>
     <button class="btn grow primary" id="btnCropOk">Redresser</button>
@@ -209,6 +227,7 @@
     <button class="chip" data-filter="gray" aria-pressed="false">Gris</button>
     <button class="chip" data-filter="bw" aria-pressed="false">Noir et blanc</button>
     <button class="chip" data-filter="orig" aria-pressed="false">Original</button>
+    <button class="chip" id="btnOcrResult">Extraire le texte</button>
   </div>
   <footer class="bar spread">
     <button class="btn" id="btnRotate">Pivoter</button>
@@ -224,10 +243,35 @@
     <button class="btn danger" id="btnClear">Tout effacer</button>
   </header>
   <div id="pagesList"></div>
+  <div class="bar spread tight">
+    <button class="btn grow" id="btnOcrAll">Extraire le texte de toutes les pages</button>
+  </div>
   <footer class="bar spread">
     <button class="btn" id="btnMore">Scanner</button>
     <button class="btn grow" id="btnDownload">Télécharger</button>
     <button class="btn grow primary" id="btnShare">Partager le PDF</button>
+  </footer>
+</section>
+
+<!-- 5. Texte extrait -->
+<section id="screen-ocr" class="screen">
+  <header class="top">
+    <h1>Texte extrait</h1>
+    <select id="ocrLang" aria-label="Langue du document">
+      <option value="fra">Français</option>
+      <option value="eng">Anglais</option>
+      <option value="fra+eng">Français et anglais</option>
+    </select>
+  </header>
+  <textarea id="ocrText" spellcheck="false" aria-label="Texte extrait"></textarea>
+  <p class="note" id="ocrNote"></p>
+  <div class="bar spread tight">
+    <button class="btn grow" id="btnOcrCopy">Copier</button>
+    <button class="btn grow" id="btnOcrDownload">Télécharger .txt</button>
+    <button class="btn grow primary" id="btnOcrShare">Partager</button>
+  </div>
+  <footer class="bar spread">
+    <button class="btn grow" id="btnOcrBack">Retour</button>
   </footer>
 </section>
 
@@ -307,7 +351,7 @@ const tick = () => new Promise((r) => setTimeout(r, 30));
 /* ------------------------------------------------------------------ */
 function show(name) {
   document.body.dataset.screen = name;
-  if (name === 'scan') startCamera(); else stopCamera();
+  if (name === 'scan') { terminateOcr(); startCamera(); } else stopCamera();
   if (name === 'crop') drawCrop();
   if (name === 'pages') renderPages();
 }
@@ -355,11 +399,23 @@ function loadScript(src) {
   });
 }
 
+// Au premier chargement, le service worker n’est pas encore actif : OpenCV (plusieurs Mo) ne
+// serait gardé en mémoire qu’à la visite suivante. On le redemande donc une fois le service
+// worker prêt ; le cache HTTP du navigateur évite de le retélécharger.
+async function warmCache(url) {
+  try {
+    if (!('serviceWorker' in navigator)) return;
+    await navigator.serviceWorker.ready;
+    const sameOrigin = new URL(url, location.href).origin === location.origin;
+    await fetch(url, { cache: 'force-cache', mode: sameOrigin ? 'same-origin' : 'no-cors' });
+  } catch (e) { console.warn('Mise en cache :', e); }
+}
+
 async function initCv() {
   setStatus('Chargement d’OpenCV…');
-  let loaded = false;
+  let loaded = false, loadedSrc = null;
   for (const src of CV_SOURCES) {
-    try { await loadScript(src); loaded = true; break; }
+    try { await loadScript(src); loaded = true; loadedSrc = src; break; }
     catch (e) { console.warn(e.message); }
   }
   if (!loaded) {
@@ -379,6 +435,7 @@ async function initCv() {
   });
   state.cvReady = true;
   setStatus('Prêt', 'ok');
+  warmCache(loadedSrc);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1203,9 +1260,9 @@ function applyFilter() {
 
 $('chips').addEventListener('click', async (e) => {
   const btn = e.target.closest('.chip');
-  if (!btn) return;
+  if (!btn || !btn.dataset.filter) return;
   state.filter = btn.dataset.filter;
-  document.querySelectorAll('.chip').forEach((c) =>
+  document.querySelectorAll('#chips .chip[data-filter]').forEach((c) =>
     c.setAttribute('aria-pressed', String(c === btn)));
   await busy('Application du filtre…', async () => applyFilter());
 });
@@ -1287,7 +1344,12 @@ function renderPages() {
       updateCount();
       renderPages();
     });
-    card.append(img, num, del);
+    const read = document.createElement('button');
+    read.className = 'ocr';
+    read.textContent = 'Texte';
+    read.setAttribute('aria-label', 'Extraire le texte de la page ' + (i + 1));
+    read.addEventListener('click', () => runOcr([{ label: 'Page ' + (i + 1), input: page.blob, trim: true }], 'pages'));
+    card.append(img, num, del, read);
     list.appendChild(card);
   });
 }
@@ -1398,6 +1460,191 @@ $('btnShare').addEventListener('click', async () => {
     }
   } catch (e) {
     if (e && e.name !== 'AbortError') { console.error(e); downloadBlob(blob, name); }
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/*  Reconnaissance de texte (OCR) avec Tesseract.js                    */
+/* ------------------------------------------------------------------ */
+// Les fichiers du dossier « ocr/ » (à côté de index.html) sont utilisés en priorité : ils
+// fonctionnent hors ligne. S’ils sont absents, tout est téléchargé une fois depuis jsDelivr.
+const OCR_VERSION = '7.0.0';
+const OCR_CORE_VERSION = '6.1.2';
+const OCR_CDN = 'https://cdn.jsdelivr.net/npm/';
+const ocr = { worker: null, lang: null, local: null, sources: [], returnTo: 'result', prefix: '' };
+
+function wasmSimd() {
+  try {
+    return WebAssembly.validate(new Uint8Array(
+      [0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 123, 3, 2, 1, 0, 10, 10, 1, 8, 0, 65, 0, 253, 15, 253, 98, 11]));
+  } catch (e) { return false; }
+}
+
+async function ocrHasLocal() {
+  if (ocr.local !== null) return ocr.local;
+  try { ocr.local = (await fetch('ocr/worker.min.js')).ok; } catch (e) { ocr.local = false; }
+  return ocr.local;
+}
+
+async function loadOcrLib() {
+  if (window.Tesseract) return;
+  const sources = [OCR_CDN + 'tesseract.js@' + OCR_VERSION + '/dist/tesseract.min.js'];
+  if (await ocrHasLocal()) sources.unshift('ocr/tesseract.min.js');
+  for (const src of sources) {
+    try { await loadScript(src); if (window.Tesseract) return; } catch (e) { console.warn(e.message); }
+  }
+  throw new Error('Tesseract indisponible');
+}
+
+function ocrLogger(m) {
+  const labels = {
+    'loading tesseract core': 'Chargement du moteur',
+    'initializing tesseract': 'Initialisation',
+    'loading language traineddata': 'Chargement de la langue',
+    'initializing api': 'Initialisation',
+    'recognizing text': 'Lecture du texte'
+  };
+  const label = labels[m.status];
+  if (!label) return;
+  const pct = typeof m.progress === 'number' ? ' ' + Math.round(m.progress * 100) + ' %' : '';
+  $('busyText').textContent = ocr.prefix + label + pct;
+}
+
+async function terminateOcr() {
+  const w = ocr.worker;
+  ocr.worker = null;
+  ocr.lang = null;
+  if (w) { try { await w.terminate(); } catch (e) { console.warn(e); } }
+}
+
+async function getOcrWorker(lang) {
+  if (ocr.worker && ocr.lang === lang) return ocr.worker;
+  await terminateOcr();
+  await loadOcrLib();
+  const local = await ocrHasLocal();
+  const abs = (path) => new URL(path, location.href).href;
+  const simd = wasmSimd();
+  const cdnCore = OCR_CDN + 'tesseract.js-core@' + OCR_CORE_VERSION +
+    '/tesseract-core' + (simd ? '-simd' : '') + '-lstm.wasm.js';
+  const options = { logger: ocrLogger, errorHandler: (e) => console.error(e) };
+  if (local) {
+    options.workerPath = abs('ocr/worker.min.js');
+    options.workerBlobURL = false;           // même origine : le service worker garde les fichiers
+    options.langPath = abs('ocr/lang');
+    options.corePath = simd ? abs('ocr/tesseract-core-simd-lstm.wasm.js') : cdnCore;
+  } else {
+    options.corePath = cdnCore;
+  }
+  const worker = await Tesseract.createWorker(lang, 1, options);   // 1 = moteur LSTM
+  ocr.worker = worker;
+  ocr.lang = lang;
+  return worker;
+}
+
+// Prépare l’image pour la lecture : on rogne une fine marge (les bords d’une page redressée
+// contiennent souvent un liseré sombre lu à tort comme des « | ») puis on ajoute un bord blanc.
+async function prepareOcrImage(input, trim) {
+  const src = input instanceof Blob ? await createImageBitmap(input) : input;
+  const w = src.width, h = src.height, base = Math.min(w, h);
+  const m = trim ? Math.round(base * 0.012) : 0;
+  const pad = Math.round(base * 0.02);
+  const c = document.createElement('canvas');
+  c.width = w - 2 * m + 2 * pad;
+  c.height = h - 2 * m + 2 * pad;
+  const x = c.getContext('2d');
+  x.fillStyle = '#fff';
+  x.fillRect(0, 0, c.width, c.height);
+  x.drawImage(src, m, m, w - 2 * m, h - 2 * m, pad, pad, w - 2 * m, h - 2 * m);
+  if (src.close) src.close();
+  return c;
+}
+
+async function runOcr(sources, returnTo) {
+  if (!sources.length) { toast('Aucune page à lire.'); return; }
+  ocr.sources = sources;
+  ocr.returnTo = returnTo;
+  const lang = $('ocrLang').value;
+  const parts = [];
+  try {
+    await busy('Préparation de la lecture…', async () => {
+      const worker = await getOcrWorker(lang);
+      for (let i = 0; i < sources.length; i++) {
+        ocr.prefix = sources.length > 1 ? 'Page ' + (i + 1) + ' sur ' + sources.length + ' : ' : '';
+        $('busyText').textContent = ocr.prefix + 'Lecture du texte';
+        const image = await prepareOcrImage(sources[i].input, sources[i].trim);
+        const { data } = await worker.recognize(image);
+        parts.push({ label: sources[i].label, text: data.text.trim(), conf: data.confidence });
+      }
+    });
+  } catch (e) {
+    console.error(e);
+    toast('La lecture du texte a échoué. Une première connexion est nécessaire pour charger le moteur.');
+    return;
+  } finally {
+    ocr.prefix = '';
+  }
+
+  const text = parts.length > 1
+    ? parts.map((p) => '--- ' + p.label + ' ---\n' + p.text).join('\n\n')
+    : parts[0].text;
+  $('ocrText').value = text;
+  const withText = parts.filter((p) => p.text);
+  const conf = withText.length ? withText.reduce((a, p) => a + p.conf, 0) / withText.length : 0;
+  $('ocrNote').textContent = !withText.length
+    ? 'Aucun texte détecté. Essayez le filtre Gris ou Noir et blanc, ou une photo plus nette et mieux éclairée.'
+    : conf < 60
+      ? 'Lecture peu fiable (' + Math.round(conf) + ' %). Vérifiez la langue choisie, la netteté et l’éclairage.'
+      : 'Confiance moyenne : ' + Math.round(conf) + ' %. Relisez et corrigez le texte au besoin.';
+  show('ocr');
+}
+
+$('btnOcrResult').addEventListener('click', () =>
+  runOcr([{ label: 'Page', input: resultCanvas, trim: true }], 'result'));
+$('btnOcrRaw').addEventListener('click', () =>
+  runOcr([{ label: 'Image', input: state.raw, trim: false }], 'crop'));
+$('btnOcrAll').addEventListener('click', () =>
+  runOcr(state.pages.map((p, i) => ({ label: 'Page ' + (i + 1), input: p.blob, trim: true })), 'pages'));
+
+$('ocrLang').addEventListener('change', () => {
+  try { localStorage.setItem('ocrLang', $('ocrLang').value); } catch (e) { /* stockage indisponible */ }
+  if (ocr.sources.length) runOcr(ocr.sources, ocr.returnTo);
+});
+try {
+  const saved = localStorage.getItem('ocrLang');
+  if (saved && [...$('ocrLang').options].some((o) => o.value === saved)) $('ocrLang').value = saved;
+} catch (e) { /* stockage indisponible */ }
+
+$('btnOcrBack').addEventListener('click', () => show(ocr.returnTo));
+
+$('btnOcrCopy').addEventListener('click', async () => {
+  const field = $('ocrText');
+  if (!field.value) return;
+  try {
+    await navigator.clipboard.writeText(field.value);
+  } catch (e) {
+    field.select();
+    document.execCommand('copy');
+  }
+  toast('Texte copié');
+});
+
+function textName() { return pdfName().replace('Scan_', 'Texte_').replace('.pdf', '.txt'); }
+
+$('btnOcrDownload').addEventListener('click', () => {
+  const text = $('ocrText').value;
+  if (!text) return;
+  downloadBlob(new Blob([text], { type: 'text/plain;charset=utf-8' }), textName());
+  toast('Texte enregistré dans les téléchargements');
+});
+
+$('btnOcrShare').addEventListener('click', async () => {
+  const text = $('ocrText').value;
+  if (!text) return;
+  try {
+    if (navigator.share) await navigator.share({ title: 'Texte extrait', text });
+    else { downloadBlob(new Blob([text], { type: 'text/plain;charset=utf-8' }), textName()); toast('Partage indisponible, texte téléchargé'); }
+  } catch (e) {
+    if (e && e.name !== 'AbortError') console.error(e);
   }
 });
 
